@@ -51,5 +51,5 @@ accelerate launch \
     --num_processes=$NUM_PROCESSES \
     --mixed_precision=fp16 \
     --multi_gpu \
-    extract_train_feature_2D.py 2>&1 | tee extract_2D_log.txt
+    extract_train_feature_2D.py 2>&1 | tee extract_recon_2D_log.txt
 

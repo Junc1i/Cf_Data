@@ -50,7 +50,7 @@ pip install bitsandbytes
 先单独拿出30K样本（重建任务输入输出都是同一张图片，所以只要拿30k张图）作为testset，单独放一个文件夹。剩下的图片都作为训练样本。
 #### 提取train feature
 给模型的**输入输出都是同一张图片，指定一个trainset图片路径即可**
-需要**修改sh中的相关配置**，下载image vae weights，记录下model weights路径（https://huggingface.co/turkeyju/tokenizer_tatitok_sl128_vae/tree/main）
+需要**修改sh中的相关配置**，下载image vae weights，记录下[model weights路径](https://huggingface.co/turkeyju/tokenizer_tatitok_sl128_vae/tree/main)
 使用**Crossflow/scripts/recon_task/run_multi_gpu.sh**运行八卡提取。运行后会保存目录下所有图片的npz文件
 
 ```sh
@@ -128,7 +128,7 @@ python extract_test_feature.py --bz 32 --device cuda:0 --image_dir "D:\test_imag
 先单独拿出30K样本（重建任务输入输出都是同一张图片，所以只要拿30k张图）作为testset，单独放一个文件夹。剩下的图片都作为训练样本。
 #### 提取train feature
 给模型的**输入输出都是同一张图片，指定一个trainset图片路径即可**
-需要**修改sh中的相关配置**，下载image vae weights，记录下model weights路径（https://huggingface.co/QHL067/CrossFlow/blob/main/assets.tar）
+需要**修改sh中的相关配置**，下载image vae weights，记录下[model weights路径](https://huggingface.co/QHL067/CrossFlow/blob/main/assets.tar),使用assets/stable-diffusion/autoencoder_kl.pth
 使用**Crossflow/scripts/recon_task/run_multi_gpu_2D.sh**运行八卡提取。运行后会保存路径下所有图片的npz文件
 
 ```sh
@@ -208,7 +208,7 @@ python extract_test_feature.py --bz 32 --device cuda:0 --image_dir "D:\test_imag
 先单独拿出60K样本（visual instruction任务输入输出都是不同图片，所以要从数据集路径下的input image dir拿30k张图,从output image dir拿30k张图）作为testset，单独放一个文件夹。剩下的图片都作为训练样本。
 #### 提取train feature
 给模型的输入输出不是同一张图片，**需要指定input和ouput image的路径，提取的token_embedding，toke_mask是input image的，z_mean,z_logvar是output image的**
-需要**修改sh中的相关配置**，下载image vae weights，记录下model weights路径（https://huggingface.co/turkeyju/tokenizer_tatitok_sl128_vae/tree/main）
+需要**修改sh中的相关配置**，下载image vae weights，记录下[model weights路径](https://huggingface.co/turkeyju/tokenizer_tatitok_sl128_vae/tree/main)
 使用**Crossflow/scripts/visual_instuction_task/run_multi_gpu.sh**运行八卡提取。运行后会保存目录下所有图片的npz文件。
 
 ```sh
@@ -297,7 +297,7 @@ python extract_test_feature.py --bz 32 --device cuda:0 --image_dir "D:\test_imag
 #### 提取train feature
 
 给模型的输入输出不是同一张图片，**需要指定input和ouput image的路径，提取的token_embedding，toke_mask是input image的，z_mean,z_logvar是output image的**
-需要**修改sh中的相关配置**，下载image vae weights，记录下model weights路径（https://huggingface.co/QHL067/CrossFlow/blob/main/assets.tar）
+需要**修改sh中的相关配置**，下载image vae weights，记录下[model weights路径](https://huggingface.co/QHL067/CrossFlow/blob/main/assets.tar),使用assets/stable-diffusion/autoencoder_kl.pth
 使用**Crossflow/scripts/visual_instuction_task/run_multi_gpu_2D.sh**运行八卡提取。运行后会保存目录下所有图片的npz文件。
 
 ```sh

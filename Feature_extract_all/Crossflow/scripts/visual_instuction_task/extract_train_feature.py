@@ -319,7 +319,13 @@ def main():
             print(f"创建保存目录: {save_dir}")
         else:
             print(f"保存目录已存在，将进行增量处理: {save_dir}")
-    accelerator.wait_for_everyone()  # 等待主进程检查/创建完文件夹
+    if accelerator.is_main_process:
+        run_id = time.strftime("%Y%m%d-%H%M%S")
+        with open(os.path.join(save_dir, ".current_run_id"), "w") as f:
+            f.write(run_id)
+    accelerator.wait_for_everyone()
+    with open(os.path.join(save_dir, ".current_run_id"), "r") as f:
+        run_id = f.read().strip()
     
     # 加载模型
     vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
@@ -631,56 +637,56 @@ def main():
             saved_count = 0
             
             # 策略：先批量保存npz（极快），后续可以用单独脚本转换回npy
-            batch_file = os.path.join(save_dir, f'batch_{batch_idx}_rank{process_id}.npz')
+            batch_file = os.path.join(save_dir, f"batch_{run_id}_{batch_idx:06d}_rank{process_id}.npz")
             
-            if not os.path.exists(batch_file):
-                # 准备批量数据（使用与dataset.py兼容的格式）
-                # 确定LLM类型：Janus-Pro-1B → 't5'
-                llm_type = 't5'  # 与配置文件保持一致
+            # 准备批量数据（使用与dataset.py兼容的格式）
+            # 确定LLM类型：Janus-Pro-1B → 't5'
+            llm_type = 't5'  # 与配置文件保持一致
+            
+            batch_data = {
+                'sample_names': batch_names,
+                'input_image_relative_paths': batch_input_relative_paths,    # 输入图像相对路径（用于embeddings/masks）
+                'output_image_relative_paths': batch_output_relative_paths,  # 输出图像相对路径（用于moments）
+                'vae_type': '1D',  # 标记VAE类型
+                'llm': llm_type,   # 保存LLM类型
+                'resolution': 256, # 保存分辨率
+            }
+            
+            # 收集所有数据
+            all_means = []
+            all_logvars = []
+            all_embeddings = []
+            all_masks = []
+            
+            for z_256, te_t, tm_t in zip(
+                encoded_tokens_256_list,  
+                batch_embeddings, 
+                batch_attention_masks):
                 
-                batch_data = {
-                    'sample_names': batch_names,
-                    'input_image_relative_paths': batch_input_relative_paths,    # 输入图像相对路径（用于embeddings/masks）
-                    'output_image_relative_paths': batch_output_relative_paths,  # 输出图像相对路径（用于moments）
-                    'vae_type': '1D',  # 标记VAE类型
-                    'llm': llm_type,   # 保存LLM类型
-                    'resolution': 256, # 保存分辨率
-                }
-                
-                # 收集所有数据
-                all_means = []
-                all_logvars = []
-                all_embeddings = []
-                all_masks = []
-                
-                for z_256, te_t, tm_t in zip(
-                    encoded_tokens_256_list,  
-                    batch_embeddings, 
-                    batch_attention_masks):
-                    
-                    all_means.append(z_256['mean'])
-                    all_logvars.append(z_256['logvar'])
-                    all_embeddings.append(te_t)
-                    all_masks.append(np.array(tm_t))
-                
-                # 堆叠为数组（更高效）
-                batch_data['means'] = np.stack(all_means)  # [batch_size, 16, 1, 128]
-                batch_data['logvars'] = np.stack(all_logvars)
-                batch_data['embeddings'] = np.stack(all_embeddings)  # [batch_size, 576, 2048]
-                batch_data['masks'] = np.stack(all_masks)
-                
-                try:
-                    # 一次性保存整个batch（256个样本 → 1次I/O，超快！）
-                    np.savez(batch_file, **batch_data)
-                    saved_count = len(batch_names)
-                    idx += saved_count
-                    
-                    if batch_idx % 5 == 0:
-                        print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功，文件: {os.path.basename(batch_file)}")
-                except Exception as e:
-                    print(f'[Rank {process_id}] 批量保存失败: {e}')
-                    import traceback
-                    traceback.print_exc()
+                all_means.append(z_256['mean'])
+                all_logvars.append(z_256['logvar'])
+                all_embeddings.append(te_t)
+                all_masks.append(np.array(tm_t))
+            
+            # 堆叠为数组（更高效）
+            batch_data['means'] = np.stack(all_means)  # [batch_size, 16, 1, 128]
+            batch_data['logvars'] = np.stack(all_logvars)
+            batch_data['embeddings'] = np.stack(all_embeddings)  # [batch_size, 576, 2048]
+            batch_data['masks'] = np.stack(all_masks)
+            
+            try:
+                # 原子写：先写 .tmp，再用 os.replace 覆盖（即使旧文件已损坏也能安全重写）
+                tmp_path = batch_file + ".tmp"
+                np.savez_compressed(tmp_path, **batch_data)
+                os.replace(tmp_path, batch_file)
+
+                saved_count = len(batch_names)
+                idx += saved_count
+                if batch_idx % 5 == 0:
+                    print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功，文件: {os.path.basename(batch_file)}")
+            except Exception as e:
+                print(f'[Rank {process_id}] 批量保存失败: {e}')
+                import traceback; traceback.print_exc()
             
             save_time = time.time() - save_start
             if batch_idx % 5 == 0:
@@ -806,16 +812,37 @@ def main():
         import datetime
         log_file = os.path.join(save_dir, "processing_log.txt")
         
-        # 获取源目录的总图片数
-        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-        total_source_images = 0
-        for fname in os.listdir(input_image_path):
-            if os.path.splitext(fname)[1].lower() in valid_extensions:
-                total_source_images += 1
+        # === 递归计数输入总图片数（与 dataset 扫描保持一致）===
+        def _count_images(root, recursive):
+            exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+            if recursive:
+                cnt = 0
+                for r, _, files in os.walk(root):
+                    cnt += sum(os.path.splitext(n)[1].lower() in exts for n in files)
+                return cnt
+            else:
+                return sum(os.path.splitext(n)[1].lower() in exts for n in os.listdir(root))
+
+        total_source_images = _count_images(input_image_path, recursive_scan)
         
-        # 统计当前总处理量
-        total_npy_files = len([f for f in os.listdir(save_dir) if f.endswith('.npy')])
-        
+        processed_keys = set()
+        for fname in os.listdir(save_dir):
+            fp = os.path.join(save_dir, fname)
+            if os.path.isfile(fp) and fname.endswith('.npy'):
+                processed_keys.add(extract_number_key(fname))
+            elif os.path.isfile(fp) and fname.startswith('batch_') and fname.endswith('.npz'):
+                try:
+                    with np.load(fp, allow_pickle=True) as z:
+                        if 'sample_names' in z:
+                            for s in z['sample_names']:
+                                processed_keys.add(extract_number_key(str(s)))
+                except Exception:
+                    pass
+
+        total_processed = len(processed_keys)
+        progress_pct = (total_processed / total_source_images * 100) if total_source_images > 0 else 0.0
+
+        # === 写日志 ===
         with open(log_file, 'a', encoding='utf-8') as f:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"\n{'='*80}\n")
@@ -824,21 +851,12 @@ def main():
             f.write(f"本次处理:\n")
             f.write(f"  - 成功处理: {total_saved} 张图片\n")
             f.write(f"  - 各GPU处理数量: {all_idx.cpu().tolist()}\n")
-            
-            if all_failed_lists:
-                all_failed = []
-                for proc_failed_list in all_failed_lists:
-                    if proc_failed_list:
-                        all_failed.extend(proc_failed_list)
-                all_failed = list(set(all_failed))
-                if all_failed:
-                    f.write(f"  - 失败样本数: {len(all_failed)}\n")
-            
+            if all_failed:
+                f.write(f"  - 失败样本数: {len(all_failed)}\n")
             f.write(f"\n总体进度:\n")
             f.write(f"  - 源目录图片总数: {total_source_images} 张\n")
-            f.write(f"  - 已处理总数: {total_npy_files} 张\n")
-            f.write(f"  - 待处理数量: {total_source_images - total_npy_files} 张\n")
-            progress_pct = (total_npy_files / total_source_images * 100) if total_source_images > 0 else 0
+            f.write(f"  - 已处理总数: {total_processed} 张\n")
+            f.write(f"  - 待处理数量: {total_source_images - total_processed} 张\n")
             f.write(f"  - 完成进度: {progress_pct:.2f}%\n")
             f.write(f"\n配置信息:\n")
             f.write(f"  - GPU数量: {accelerator.num_processes}\n")
@@ -848,13 +866,11 @@ def main():
             f.write(f"  - 输出图像目录（moments）: {output_image_path}\n")
             f.write(f"  - 保存目录: {save_dir}\n")
             f.write(f"{'='*80}\n")
-        
-        print(f'\n处理记录已保存到: {log_file}')
-        print(f'所有特征已保存到: {save_dir}')
+
         print(f'\n总体进度统计:')
         print(f'  源目录总图片数: {total_source_images}')
-        print(f'  已处理总数: {total_npy_files}')
-        print(f'  待处理数量: {total_source_images - total_npy_files}')
+        print(f'  已处理总数: {total_processed}')
+        print(f'  待处理数量: {total_source_images - total_processed}')
         print(f'  完成进度: {progress_pct:.2f}%')
         print(f'==================\n')
 

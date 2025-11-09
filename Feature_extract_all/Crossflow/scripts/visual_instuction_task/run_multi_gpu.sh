@@ -1,7 +1,13 @@
 #!/bin/bash
 
-# 多GPU并行处理脚本
+# 多GPU并行处理脚本 - 1D特征提取版本（TATiTok）
+# 适用于单一数据集或单个任务
 # 使用accelerate launch启动多卡并行
+# 
+# 特点：
+# - 处理单个 input/output 文件夹对
+# - NPZ文件包含相对路径（相对于INPUT_IMAGE_PATH和OUTPUT_IMAGE_PATH）
+# - 训练时需要设置 train_img_path=OUTPUT_IMAGE_PATH
 
 # ==================== 重要变量配置 ====================
 # 批次大小（根据GPU显存调整）

@@ -10,15 +10,10 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 import torch
-import torch.nn as nn
-import os
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
-import io
 import einops
-import random
-import json
 import time
 import re
 import libs.autoencoder
@@ -43,23 +38,54 @@ def recreate_folder(folder_path):
 
 def extract_number_key(filename):
     """
-    从文件名中提取数字部分作为匹配键
-    例如：'000001_00000303_textbox.png' -> '000001_00000303'
-          '000001_00000303_edit.png' -> '000001_00000303'
+    从文件名中提取匹配键，支持多种格式
     
-    支持多种格式：
-    - 连续数字和下划线组合：'000001_00000303'
-    - 纯数字：'123456'
+    示例：
+    - '000001_00000303_textbox.png' -> '000001_00000303'
+    - '000001_00000303_edit.png' -> '000001_00000303'
+    - '996de8d0-1585-4612-ba08-3f3dadf147bd_render.JPEG' -> '996de8d0-1585-4612-ba08-3f3dadf147bd'
+    - '996de8d0-1585-4612-ba08-3f3dadf147bd.jpg' -> '996de8d0-1585-4612-ba08-3f3dadf147bd'
+    - 'image_000003.JPEG' -> 'image_000003'
+    
+    支持格式：
+    - UUID格式：'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+    - 数字和下划线组合：'000001_00000303'
+    - 文件名主体（去除常见后缀）：'image_000003'
     """
     basename = os.path.splitext(filename)[0]  # 移除扩展名
     
-    # 尝试匹配连续的数字和下划线模式（最常见）
+    # 策略1: 尝试提取UUID格式（8-4-4-4-12）
+    # 例如：996de8d0-1585-4612-ba08-3f3dadf147bd
+    uuid_pattern = r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    uuid_match = re.search(uuid_pattern, basename, re.IGNORECASE)
+    if uuid_match:
+        return uuid_match.group(1).lower()  # 统一转小写
+    
+    # 策略2: 去除常见的后缀（_render, _edit, _output, _input, _src, _dst等）
+    # 这样 'abc_render' 和 'abc' 会匹配到相同的键 'abc'
+    common_suffixes = [
+        '_render', '_edit', '_output', '_input', 
+        '_src', '_dst', '_source', '_target',
+        '_textbox', '_mask', '_original', '_processed'
+    ]
+    cleaned_basename = basename
+    for suffix in common_suffixes:
+        if cleaned_basename.endswith(suffix):
+            cleaned_basename = cleaned_basename[:-len(suffix)]
+            break
+    
+    # 策略3: 尝试匹配开头的连续数字和下划线模式
     # 例如：000001_00000303
-    match = re.search(r'^(\d+(?:_\d+)*)', basename)
+    match = re.search(r'^(\d+(?:_\d+)*)', cleaned_basename)
     if match:
         return match.group(1)
     
-    # 如果没找到，尝试提取所有数字部分并用下划线连接
+    # 策略4: 如果上面都不匹配，返回清理后的basename
+    # 这样 'image_000003_render' 和 'image_000003' 都会返回 'image_000003'
+    if cleaned_basename != basename:
+        return cleaned_basename
+    
+    # 策略5: 尝试提取所有数字部分并用下划线连接
     numbers = re.findall(r'\d+', basename)
     if numbers:
         return '_'.join(numbers)
@@ -91,10 +117,22 @@ class ImageFeatureDataset(Dataset):
     - input_image_path: 用于提取embeddings和masks（输入图像）
     - output_image_path: 用于提取moments（输出图像）
     
-    输入和输出图像通过文件名中的数字部分进行匹配，例如：
+    输入和输出图像通过智能文件名匹配进行配对，支持多种格式：
+    
+    示例1 - UUID格式：
+    - 输入：{class_label}/996de8d0-1585-4612-ba08-3f3dadf147bd_render.JPEG
+    - 输出：{class_label}/996de8d0-1585-4612-ba08-3f3dadf147bd.jpg
+    - 匹配键：996de8d0-1585-4612-ba08-3f3dadf147bd
+    
+    示例2 - 数字ID格式：
     - 输入：000001_00000303_textbox.png
     - 输出：000001_00000303_edit.png
-    匹配键：000001_00000303
+    - 匹配键：000001_00000303
+    
+    示例3 - 文件名格式：
+    - 输入：image_000003.JPEG
+    - 输出：image_000003.png
+    - 匹配键：image_000003
     """
     def __init__(self, input_image_path, output_image_path, save_dir=None, skip_processed=True, recursive=True):
         self.input_image_path = input_image_path
@@ -277,6 +315,9 @@ def main():
         NUM_WORKERS: DataLoader工作进程数
         PREFETCH_FACTOR: 预取因子
         RECURSIVE_SCAN: 是否递归扫描子文件夹
+        TASK_PREFIX: 任务前缀（可选，格式: task_type__edit_method）
+                     - 如果设置，路径会保存为相对于ROOT_DIR的完整结构
+                     - 如果不设置，路径保存为相对于INPUT/OUTPUT_IMAGE_PATH
     """
     # 从环境变量读取配置参数
     bz = int(os.getenv('BATCH_SIZE', '1024'))
@@ -288,6 +329,7 @@ def main():
     num_workers = int(os.getenv('NUM_WORKERS', '16'))
     prefetch_factor = int(os.getenv('PREFETCH_FACTOR', '8'))
     recursive_scan = os.getenv('RECURSIVE_SCAN', 'true').lower() == 'true'
+    task_prefix = os.getenv('TASK_PREFIX', '')  # 任务前缀，用于区分不同任务类型和编辑方法
     # 初始化Accelerator，支持多GPU并行
     accelerator = Accelerator()
     device = accelerator.device
@@ -303,6 +345,8 @@ def main():
         print(f"  输入图像路径（embeddings/masks）: {input_image_path}")
         print(f"  输出图像路径（moments）: {output_image_path}")
         print(f"  保存路径: {save_dir}")
+        if task_prefix:
+            print(f"  任务标识: {task_prefix}")
         print(f"  递归扫描: {recursive_scan}")
         print(f"  工作进程: {num_workers}")
     
@@ -317,10 +361,52 @@ def main():
         else:
             print(f"保存目录已存在，将进行增量处理: {save_dir}")
     if accelerator.is_main_process:
+        # 检查是否存在上次未完成的运行
+        run_id_file = os.path.join(save_dir, ".current_run_id")
+        if os.path.exists(run_id_file):
+            # 读取上次的run_id
+            with open(run_id_file, "r") as f:
+                old_run_id = f.read().strip()
+            
+            # 检查上次运行是否成功完成
+            success_file = os.path.join(save_dir, f".run_{old_run_id}_completed")
+            if os.path.exists(success_file):
+                print(f"检测到上次运行ID: {old_run_id} 已成功完成，无需清理")
+            else:
+                # 清理上次未完成的NPZ文件
+                print(f"检测到上次运行ID: {old_run_id} 未完成，开始清理未完成的NPZ文件...")
+                cleaned_count = 0
+                for filename in os.listdir(save_dir):
+                    if filename.startswith(f"batch_{old_run_id}_") and filename.endswith('.npz'):
+                        npz_path = os.path.join(save_dir, filename)
+                        try:
+                            os.remove(npz_path)
+                            cleaned_count += 1
+                        except Exception as e:
+                            print(f"警告：无法删除文件 {filename}: {e}")
+                    # 同时清理临时文件
+                    elif filename.startswith(f"batch_{old_run_id}_") and filename.endswith('.npz.tmp'):
+                        tmp_path = os.path.join(save_dir, filename)
+                        try:
+                            os.remove(tmp_path)
+                            cleaned_count += 1
+                        except Exception as e:
+                            print(f"警告：无法删除临时文件 {filename}: {e}")
+                
+                if cleaned_count > 0:
+                    print(f"已清理 {cleaned_count} 个未完成的文件")
+                else:
+                    print(f"未找到需要清理的文件（可能已手动清理）")
+        
+        # 生成新的run_id
         run_id = time.strftime("%Y%m%d-%H%M%S")
-        with open(os.path.join(save_dir, ".current_run_id"), "w") as f:
+        print(f"本次运行ID: {run_id}")
+        with open(run_id_file, "w") as f:
             f.write(run_id)
+    
     accelerator.wait_for_everyone()  # 等待主进程检查/创建完文件夹
+    
+    # 所有进程读取run_id
     with open(os.path.join(save_dir, ".current_run_id"), "r") as f:
         run_id = f.read().strip()
     
@@ -394,353 +480,383 @@ def main():
     
     # 整个推理过程禁用梯度计算，避免内存泄漏
     with torch.no_grad():
-      try:
-        for batch_idx, batch in enumerate(dataloader):
-            # 记录每个批次的开始时间
-            batch_start_time = time.time()
-            
-            # 每个批次开始时打印进程信息（调试用）
-            if batch_idx % 5 == 0:
-                print(f"[Rank {accelerator.process_index}] 开始处理批次 {batch_idx}")
-            
-            # 记录失败的样本
-            success_list = batch['success'].tolist()
-
-            failed_names = [n for n, v in zip(batch['img_name'], success_list) if not v]
-            if failed_names:
-                failed_samples.extend(failed_names)
-
-            # 只处理成功样本
-            valid_mask = torch.tensor(success_list, dtype=torch.bool, device=batch['success'].device)
-
-            batch_img_256 = batch['image_256'][valid_mask].to(device, non_blocking=True)
-            batch_input_image_paths  = [p for p, v in zip(batch['input_image_path'],  success_list) if v]
-            batch_output_image_paths = [p for p, v in zip(batch['output_image_path'], success_list) if v]
-            batch_names              = [n for n, v in zip(batch['img_name'],          success_list) if v]
-            
-            # 计算输入图像相对路径（相对于input_image_path，用于embeddings/masks）
-            batch_input_relative_paths = []
-            for img_path in batch_input_image_paths:
-                try:
-                    rel_path = os.path.relpath(img_path, input_image_path)
-                    batch_input_relative_paths.append(rel_path)
-                except:
-                    batch_input_relative_paths.append(os.path.basename(img_path))
-            
-            # 计算输出图像相对路径（相对于output_image_path，用于moments）
-            batch_output_relative_paths = []
-            for img_path in batch_output_image_paths:
-                try:
-                    rel_path = os.path.relpath(img_path, output_image_path)
-                    batch_output_relative_paths.append(rel_path)
-                except:
-                    batch_output_relative_paths.append(os.path.basename(img_path))
-            
-            # 确保所有进程都走相同的代码路径
-            if len(batch_names) == 0:
-                # 确保CUDA操作完成
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+        try:
+            for batch_idx, batch in enumerate(dataloader):
+                # 记录每个批次的开始时间
+                batch_start_time = time.time()
                 
-                # 更新进度条但不提前continue，保持所有进程同步
-                if accelerator.is_main_process:
-                    progress_bar.update(1)
+                # 每个批次开始时打印进程信息（调试用）
+                if batch_idx % 5 == 0:
+                    print(f"[Rank {accelerator.process_index}] 开始处理批次 {batch_idx}")
                 
-                # 添加同步点，确保所有进程都到达这里
-                print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 无有效样本，等待同步")
-                accelerator.wait_for_everyone()
-                continue
-            
-            # 处理Janus embeddings - 批量处理版本
-            batch_embeddings = []
-            batch_attention_masks = []
-            
-            # 打印当前批次的样本数（调试用）
-            if batch_idx % 5 == 0:
-                print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 有 {len(batch_input_image_paths)} 个有效样本，开始批量处理Janus...")
-            
-            # 记录Janus处理时间
-            janus_start_time = time.time()
-            
-            try:
-                # 真正的批量处理 - 一次性加载和预处理所有图像
-                question = ""
+                # 记录失败的样本
+                success_list = batch['success'].tolist()
+
+                failed_names = [n for n, v in zip(batch['img_name'], success_list) if not v]
+                if failed_names:
+                    failed_samples.extend(failed_names)
+
+                # 只处理成功样本
+                valid_mask = torch.tensor(success_list, dtype=torch.bool, device=batch['success'].device)
+
+                batch_img_256 = batch['image_256'][valid_mask].to(device, non_blocking=True)
+                batch_input_image_paths  = [p for p, v in zip(batch['input_image_path'],  success_list) if v]
+                batch_output_image_paths = [p for p, v in zip(batch['output_image_path'], success_list) if v]
+                batch_names              = [n for n, v in zip(batch['img_name'],          success_list) if v]
                 
-                # Step 1: 批量加载所有PIL图像（并行I/O）- 从input_image_path加载
-                load_start = time.time()
-                all_pil_images = []
-                for image_path in batch_input_image_paths:
+                # 计算输入图像相对路径（包含完整的任务结构）
+                # 格式：task_type/edit_method/input/relative_path
+                batch_input_relative_paths = []
+                for img_path in batch_input_image_paths:
                     try:
-                        pil_img = Image.open(image_path).convert('RGB')
-                        all_pil_images.append(pil_img)
-                    except Exception as e:
-                        print(f"[Rank {accelerator.process_index}] 警告：加载输入图像失败 {image_path}: {e}")
-                        # 创建一个空白图像作为占位
-                        all_pil_images.append(Image.new('RGB', (384, 384), color='black'))
-                load_time = time.time() - load_start
+                        if task_prefix and '__' in task_prefix:
+                            task_type, edit_method = task_prefix.split('__', 1)
+                            # 提取相对于input目录的路径
+                            rel_to_input = os.path.relpath(img_path, input_image_path)
+                            # 组合完整路径：task_type/edit_method/input/rel_path
+                            full_rel_path = os.path.join(task_type, edit_method, 'input', rel_to_input)
+                            batch_input_relative_paths.append(full_rel_path)
+                        else:
+                            # 回退到原逻辑（不带任务前缀）
+                            rel_path = os.path.relpath(img_path, input_image_path)
+                            batch_input_relative_paths.append(rel_path)
+                    except:
+                        batch_input_relative_paths.append(os.path.basename(img_path))
                 
-                # Step 2: 批量图像预处理（一次性处理所有图像）
-                preprocess_start = time.time()
-                images_outputs = vl_chat_processor.image_processor(all_pil_images, return_tensors="pt")
-                batched_pixel_values = images_outputs.pixel_values.to(device)  # [batch_size, 3, H, W]
-                preprocess_time = time.time() - preprocess_start
+                # 计算输出图像相对路径（包含完整的任务结构）
+                # 格式：task_type/edit_method/output/relative_path
+                batch_output_relative_paths = []
+                for img_path in batch_output_image_paths:
+                    try:
+                        if task_prefix and '__' in task_prefix:
+                            task_type, edit_method = task_prefix.split('__', 1)
+                            # 提取相对于output目录的路径
+                            rel_to_output = os.path.relpath(img_path, output_image_path)
+                            # 组合完整路径：task_type/edit_method/output/rel_path
+                            full_rel_path = os.path.join(task_type, edit_method, 'output', rel_to_output)
+                            batch_output_relative_paths.append(full_rel_path)
+                        else:
+                            # 回退到原逻辑（不带任务前缀）
+                            rel_path = os.path.relpath(img_path, output_image_path)
+                            batch_output_relative_paths.append(rel_path)
+                    except:
+                        batch_output_relative_paths.append(os.path.basename(img_path))
                 
-                # Step 3: 准备批量输入（文本部分）
-                text_start = time.time()
-                # 创建统一的conversation格式（所有图像使用相同的prompt）
-                sft_format = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
-                    conversations=[
-                        {"role": "<|User|>", "content": f"<image_placeholder>\n{question}"},
-                        {"role": "<|Assistant|>", "content": ""},
-                    ],
-                    sft_format=vl_chat_processor.sft_format,
-                    system_prompt=vl_chat_processor.system_prompt,
-                )
+                # 确保所有进程都走相同的代码路径
+                if len(batch_names) == 0:
+                    # 确保CUDA操作完成
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # 更新进度条但不提前continue，保持所有进程同步
+                    if accelerator.is_main_process:
+                        progress_bar.update(1)
+                    
+                    # 添加同步点，确保所有进程都到达这里
+                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 无有效样本，等待同步")
+                    accelerator.wait_for_everyone()
+                    continue
                 
-                # tokenize（所有样本使用相同的token）
-                input_ids = vl_chat_processor.tokenizer.encode(sft_format)
-                input_ids = torch.LongTensor(input_ids)
-                
-                # 为批次中的每个样本复制input_ids
-                batch_size = len(all_pil_images)
-                batched_input_ids = input_ids.unsqueeze(0).repeat(batch_size, 1)  # [batch_size, seq_len]
-                batched_attention_mask = torch.ones_like(batched_input_ids)
-                
-                # 创建image masks
-                image_token_mask = batched_input_ids == vl_chat_processor.image_id
-                batched_images_seq_mask = image_token_mask
-                
-                # 假设每个图像有576个token（根据Janus的配置）
-                num_image_tokens = 576
-                batched_images_emb_mask = torch.zeros((batch_size, 1, num_image_tokens)).bool()
-                batched_images_emb_mask[:, :, :num_image_tokens] = True
-                
-                # 调整pixel_values形状以匹配期望的 [batch_size, n_images, 3, H, W]
-                batched_pixel_values = batched_pixel_values.unsqueeze(1)  # [batch_size, 1, 3, H, W]
-                
-                text_time = time.time() - text_start
-                
-                # Step 4: 批量编码
-                encode_start = time.time()
-                with torch.no_grad():
-                    inputs_embeds = unwrapped_vl_gpt.prepare_inputs_embeds(
-                        input_ids=batched_input_ids.to(device),
-                        pixel_values=batched_pixel_values,
-                        images_seq_mask=batched_images_seq_mask.to(device),
-                        images_emb_mask=batched_images_emb_mask.to(device)
-                    )
-                encode_time = time.time() - encode_start
-                
-                # 打印详细的时间分解
-                if batch_idx % 5 == 0:
-                    total_prep = load_time + preprocess_time + text_time
-                    print(f"[Rank {accelerator.process_index}] 时间分解 - 图像加载: {load_time:.2f}s, 预处理: {preprocess_time:.2f}s, 文本: {text_time:.3f}s, 编码: {encode_time:.2f}s")
-                    print(f"[Rank {accelerator.process_index}] 批量形状 - pixel_values: {batched_pixel_values.shape}, inputs_embeds: {inputs_embeds.shape}")
-                
-                # inputs_embeds.shape: [batch_size, 576, 2048]
-                # 批量转换到CPU（比逐个转换快得多）
-                inputs_embeds_cpu = inputs_embeds.detach().cpu().float().numpy()
-                
-                # 将批量结果拆分为单个样本
-                for i in range(inputs_embeds_cpu.shape[0]):
-                    final_tensor = inputs_embeds_cpu[i]  # [576, 2048]
-                    batch_embeddings.append(final_tensor)
-                    attention_mask = [1] * 576
-                    batch_attention_masks.append(attention_mask)
-                
-                janus_time = time.time() - janus_start_time
-                if batch_idx % 5 == 0:
-                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Janus批量处理耗时: {janus_time:.2f}秒 (平均 {janus_time/len(batch_input_image_paths):.3f}秒/张)")
-            
-            except Exception as e:
-                # 如果批量处理失败，回退到逐个处理
-                print(f"[Rank {accelerator.process_index}] 警告：批次 {batch_idx} 批量处理失败: {e}，回退到逐个处理")
-                import traceback
-                traceback.print_exc()
-                
+                # 处理Janus embeddings - 批量处理版本
                 batch_embeddings = []
                 batch_attention_masks = []
-                question = ""
                 
-                for img_idx, image_path in enumerate(batch_input_image_paths):
-                    try:
-                        conversation = [
-                            {
-                                "role": "<|User|>",
-                                "content": f"<image_placeholder>\n{question}",
-                                "images": [image_path],
-                            },
+                # 打印当前批次的样本数（调试用）
+                if batch_idx % 5 == 0:
+                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 有 {len(batch_input_image_paths)} 个有效样本，开始批量处理Janus...")
+                
+                # 记录Janus处理时间
+                janus_start_time = time.time()
+                
+                try:
+                    # 真正的批量处理 - 一次性加载和预处理所有图像
+                    question = ""
+                    
+                    # Step 1: 批量加载所有PIL图像（并行I/O）- 从input_image_path加载
+                    load_start = time.time()
+                    all_pil_images = []
+                    for image_path in batch_input_image_paths:
+                        try:
+                            pil_img = Image.open(image_path).convert('RGB')
+                            all_pil_images.append(pil_img)
+                        except Exception as e:
+                            print(f"[Rank {accelerator.process_index}] 警告：加载输入图像失败 {image_path}: {e}")
+                            # 创建一个空白图像作为占位
+                            all_pil_images.append(Image.new('RGB', (384, 384), color='black'))
+                    load_time = time.time() - load_start
+                    
+                    # Step 2: 批量图像预处理（一次性处理所有图像）
+                    preprocess_start = time.time()
+                    images_outputs = vl_chat_processor.image_processor(all_pil_images, return_tensors="pt")
+                    batched_pixel_values = images_outputs.pixel_values.to(device)  # [batch_size, 3, H, W]
+                    preprocess_time = time.time() - preprocess_start
+                    
+                    # Step 3: 准备批量输入（文本部分）
+                    text_start = time.time()
+                    # 创建统一的conversation格式（所有图像使用相同的prompt）
+                    sft_format = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
+                        conversations=[
+                            {"role": "<|User|>", "content": f"<image_placeholder>\n{question}"},
                             {"role": "<|Assistant|>", "content": ""},
-                        ]
-                        
-                        pil_images = load_pil_images(conversation)
-                        prepare_inputs = vl_chat_processor(
-                            conversations=conversation, images=pil_images, force_batchify=True
-                        ).to(device)
-                        
-                        with torch.no_grad():
-                            inputs_embeds = unwrapped_vl_gpt.prepare_inputs_embeds(**prepare_inputs)
-                        
-                        final_tensor = inputs_embeds.squeeze(dim=0)
-                        batch_embeddings.append(final_tensor.detach().cpu().float().numpy())
+                        ],
+                        sft_format=vl_chat_processor.sft_format,
+                        system_prompt=vl_chat_processor.system_prompt,
+                    )
+                    
+                    # tokenize（所有样本使用相同的token）
+                    input_ids = vl_chat_processor.tokenizer.encode(sft_format)
+                    input_ids = torch.LongTensor(input_ids)
+                    
+                    # 为批次中的每个样本复制input_ids
+                    batch_size = len(all_pil_images)
+                    batched_input_ids = input_ids.unsqueeze(0).repeat(batch_size, 1)  # [batch_size, seq_len]
+                    batched_attention_mask = torch.ones_like(batched_input_ids)
+                    
+                    # 创建image masks
+                    image_token_mask = batched_input_ids == vl_chat_processor.image_id
+                    batched_images_seq_mask = image_token_mask
+                    
+                    # 假设每个图像有576个token（根据Janus的配置）
+                    num_image_tokens = 576
+                    batched_images_emb_mask = torch.zeros((batch_size, 1, num_image_tokens)).bool()
+                    batched_images_emb_mask[:, :, :num_image_tokens] = True
+                    
+                    # 调整pixel_values形状以匹配期望的 [batch_size, n_images, 3, H, W]
+                    batched_pixel_values = batched_pixel_values.unsqueeze(1)  # [batch_size, 1, 3, H, W]
+                    
+                    text_time = time.time() - text_start
+                    
+                    # Step 4: 批量编码
+                    encode_start = time.time()
+                    with torch.no_grad():
+                        inputs_embeds = unwrapped_vl_gpt.prepare_inputs_embeds(
+                            input_ids=batched_input_ids.to(device),
+                            pixel_values=batched_pixel_values,
+                            images_seq_mask=batched_images_seq_mask.to(device),
+                            images_emb_mask=batched_images_emb_mask.to(device)
+                        )
+                    encode_time = time.time() - encode_start
+                    
+                    # 打印详细的时间分解
+                    if batch_idx % 5 == 0:
+                        total_prep = load_time + preprocess_time + text_time
+                        print(f"[Rank {accelerator.process_index}] 时间分解 - 图像加载: {load_time:.2f}s, 预处理: {preprocess_time:.2f}s, 文本: {text_time:.3f}s, 编码: {encode_time:.2f}s")
+                        print(f"[Rank {accelerator.process_index}] 批量形状 - pixel_values: {batched_pixel_values.shape}, inputs_embeds: {inputs_embeds.shape}")
+                    
+                    # inputs_embeds.shape: [batch_size, 576, 2048]
+                    # 批量转换到CPU（比逐个转换快得多）
+                    inputs_embeds_cpu = inputs_embeds.detach().cpu().float().numpy()
+                    
+                    # 将批量结果拆分为单个样本
+                    for i in range(inputs_embeds_cpu.shape[0]):
+                        final_tensor = inputs_embeds_cpu[i]  # [576, 2048]
+                        batch_embeddings.append(final_tensor)
                         attention_mask = [1] * 576
                         batch_attention_masks.append(attention_mask)
                     
-                    except Exception as e2:
-                        print(f"[Rank {accelerator.process_index}] 错误：样本 {img_idx} 处理失败: {e2}")
-                        batch_embeddings.append(np.zeros((576, 2048), dtype=np.float32))
-                        batch_attention_masks.append([1] * 576)
+                    janus_time = time.time() - janus_start_time
+                    if batch_idx % 5 == 0:
+                        print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Janus批量处理耗时: {janus_time:.2f}秒 (平均 {janus_time/len(batch_input_image_paths):.3f}秒/张)")
                 
+                except Exception as e:
+                    # 如果批量处理失败，回退到逐个处理
+                    print(f"[Rank {accelerator.process_index}] 警告：批次 {batch_idx} 批量处理失败: {e}，回退到逐个处理")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    batch_embeddings = []
+                    batch_attention_masks = []
+                    question = ""
+                    
+                    for img_idx, image_path in enumerate(batch_input_image_paths):
+                        try:
+                            conversation = [
+                                {
+                                    "role": "<|User|>",
+                                    "content": f"<image_placeholder>\n{question}",
+                                    "images": [image_path],
+                                },
+                                {"role": "<|Assistant|>", "content": ""},
+                            ]
+                            
+                            pil_images = load_pil_images(conversation)
+                            prepare_inputs = vl_chat_processor(
+                                conversations=conversation, images=pil_images, force_batchify=True
+                            ).to(device)
+                            
+                            with torch.no_grad():
+                                inputs_embeds = unwrapped_vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+                            
+                            final_tensor = inputs_embeds.squeeze(dim=0)
+                            batch_embeddings.append(final_tensor.detach().cpu().float().numpy())
+                            attention_mask = [1] * 576
+                            batch_attention_masks.append(attention_mask)
+                        
+                        except Exception as e2:
+                            print(f"[Rank {accelerator.process_index}] 错误：样本 {img_idx} 处理失败: {e2}")
+                            batch_embeddings.append(np.zeros((576, 2048), dtype=np.float32))
+                            batch_attention_masks.append([1] * 576)
+                    
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    janus_time = time.time() - janus_start_time
+                    if batch_idx % 5 == 0:
+                        print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Janus逐个处理耗时: {janus_time:.2f}秒")
+                
+                # 记录Autoencoder处理时间
+                autoencoder_start_time = time.time()
+                
+                # 处理autoencoder编码 - 只处理256
+                with torch.no_grad():
+                    moments_256 = autoencoder(batch_img_256, fn='encode_moments')
+                    if moments_256.dim() > 3:
+                        moments_256 = moments_256.squeeze(0)
+                    moments_256 = moments_256.detach().cpu().numpy()
+                
+                # 确保CUDA操作完成，避免异步操作导致的问题
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 
-                janus_time = time.time() - janus_start_time
+                autoencoder_time = time.time() - autoencoder_start_time
                 if batch_idx % 5 == 0:
-                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Janus逐个处理耗时: {janus_time:.2f}秒")
-            
-            # 记录Autoencoder处理时间
-            autoencoder_start_time = time.time()
-            
-            # 处理autoencoder编码 - 只处理256
-            with torch.no_grad():
-                moments_256 = autoencoder(batch_img_256, fn='encode_moments')
-                if moments_256.dim() > 3:
-                    moments_256 = moments_256.squeeze(0)
-                moments_256 = moments_256.detach().cpu().numpy()
-            
-            # 确保CUDA操作完成，避免异步操作导致的问题
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            autoencoder_time = time.time() - autoencoder_start_time
-            if batch_idx % 5 == 0:
-                print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Autoencoder处理耗时: {autoencoder_time:.2f}秒")
-            
-            # 保存特征 - 批量保存npz优化版（2D VAE格式）
-            save_start = time.time()
-            
-            process_id = accelerator.process_index
-            saved_count = 0
-            
-            # 策略：先批量保存npz（极快），后续可以用单独脚本转换回npy
-            batch_file = os.path.join(save_dir, f"batch_{run_id}_{batch_idx:06d}_rank{process_id}.npz")
-
-            # 准备批量数据（2D VAE格式，与dataset.py兼容）
-            llm_type = 't5'  # 与配置文件保持一致
-            batch_data = {
-                'sample_names': batch_names,
-                'input_image_relative_paths': batch_input_relative_paths,
-                'output_image_relative_paths': batch_output_relative_paths,
-                'vae_type': '2D',
-                'llm': llm_type,
-                'resolution': 256,
-            }
-
-            # 收集所有数据
-            all_moments = []
-            all_embeddings = []
-            all_masks = []
-            for mt_256, te_t, tm_t in zip(moments_256, batch_embeddings, batch_attention_masks):
-                all_moments.append(mt_256)
-                all_embeddings.append(te_t)
-                all_masks.append(np.array(tm_t))
-
-            # 堆叠为数组（更高效）
-            batch_data['moments'] = np.stack(all_moments)      # [batch_size, 8, 32, 32]
-            batch_data['embeddings'] = np.stack(all_embeddings)  # [batch_size, 576, 2048]
-            batch_data['masks'] = np.stack(all_masks)
-
-            try:
-                # 原子写：先写 .tmp 再替换
-                tmp_path = batch_file + ".tmp"
-                np.savez_compressed(tmp_path, **batch_data)
-                os.replace(tmp_path, batch_file)
-
-                saved_count = len(batch_names)
-                idx += saved_count
-
-                if batch_idx % 5 == 0:
-                    print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功（2D VAE），文件: {os.path.basename(batch_file)}")
-            except Exception as e:
-                print(f'[Rank {process_id}] 批量保存失败: {e}')
-                import traceback
-                traceback.print_exc()
-
-            
-            save_time = time.time() - save_start
-            if batch_idx % 5 == 0:
-                if save_time > 0.01:
-                    speedup = 105.0 / save_time
-                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 文件保存耗时: {save_time:.2f}秒 (提速约{speedup:.1f}x)")
+                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} Autoencoder处理耗时: {autoencoder_time:.2f}秒")
+                
+                # 保存特征 - 批量保存npz优化版（2D VAE格式）
+                save_start = time.time()
+                
+                process_id = accelerator.process_index
+                saved_count = 0
+                
+                # 策略：先批量保存npz（极快），后续可以用单独脚本转换回npy
+                # 如果有task_prefix，添加到文件名中
+                if task_prefix:
+                    batch_file = os.path.join(save_dir, f"batch_{task_prefix}_{run_id}_{batch_idx:06d}_rank{process_id}.npz")
                 else:
-                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 文件保存耗时: {save_time:.2f}秒 (极快！)")
-            
-            # 打印批次完成信息和总耗时
-            batch_total_time = time.time() - batch_start_time
-            if batch_idx % 5 == 0:
-                print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 处理完成，总耗时: {batch_total_time:.2f}秒")
-            
-            # 如果某个批次耗时过长，打印警告
-            if batch_total_time > 300:  # 5分钟
-                print(f"[Rank {accelerator.process_index}] 警告：批次 {batch_idx} 耗时过长 ({batch_total_time:.2f}秒)")
-            
-            # 更新进度条
-            if accelerator.is_main_process:
-                progress_bar.update(1)
-            
-            # 每隔一定批次添加同步点，防止进程间差距过大
-            # 使用中等同步频率平衡性能和安全性（每10批次同步一次）
-            # 过于频繁会影响性能，过于稀疏可能导致hang检测延迟
-            if (batch_idx + 1) % 10 == 0:
-                # 先确保本进程的CUDA操作完成
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                    batch_file = os.path.join(save_dir, f"batch_{run_id}_{batch_idx:06d}_rank{process_id}.npz")
+
+                # 准备批量数据（2D VAE格式，与dataset.py兼容）
+                llm_type = 't5'  # 与配置文件保持一致
+                batch_data = {
+                    'sample_names': [str(name) for name in batch_names],  # 确保都是字符串
+                    'input_image_relative_paths': [str(path) for path in batch_input_relative_paths],
+                    'output_image_relative_paths': [str(path) for path in batch_output_relative_paths],
+                    'vae_type': '2D',
+                    'llm': llm_type,
+                    'resolution': 256,
+                }
                 
-                # 每个进程都打印到达同步点的信息
-                sync_time = time.time()
-                print(f"[Rank {accelerator.process_index}] ⏱ [{time.strftime('%H:%M:%S')}] 到达同步点，批次 {batch_idx + 1}/{len(dataloader)}，已保存 {idx} 个文件")
-                
-                if accelerator.is_main_process:
-                    print(f"\n[同步检查点] 已完成 {batch_idx + 1}/{len(dataloader)} 批次，所有进程准备同步...")
-                
-                # 添加同步超时保护
+                # 如果有task_prefix，解析并添加到batch_data中
+                if task_prefix and '__' in task_prefix:
+                    task_type, edit_method = task_prefix.split('__', 1)
+                    batch_data['task_type'] = task_type
+                    batch_data['edit_method'] = edit_method
+
+                # 收集所有数据
+                all_moments = []
+                all_embeddings = []
+                all_masks = []
+                for mt_256, te_t, tm_t in zip(moments_256, batch_embeddings, batch_attention_masks):
+                    all_moments.append(mt_256)
+                    all_embeddings.append(te_t)
+                    all_masks.append(np.array(tm_t))
+
+                # 堆叠为数组（更高效）
+                batch_data['moments'] = np.stack(all_moments)      # [batch_size, 8, 32, 32]
+                batch_data['embeddings'] = np.stack(all_embeddings)  # [batch_size, 576, 2048]
+                batch_data['masks'] = np.stack(all_masks)
+
                 try:
-                    # 所有进程同步
-                    accelerator.wait_for_everyone()
-                    sync_duration = time.time() - sync_time
+                    # 原子写：先写 .tmp 再替换
+                    tmp_path = batch_file + ".tmp"
+                    np.savez_compressed(tmp_path, **batch_data)
+                    os.replace(tmp_path, batch_file)
+
+                    saved_count = len(batch_names)
+                    idx += saved_count
+
+                    if batch_idx % 5 == 0:
+                        print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功（2D VAE），文件: {os.path.basename(batch_file)}")
+                except Exception as e:
+                    print(f'[Rank {process_id}] 批量保存失败: {e}')
+                    import traceback
+                    traceback.print_exc()
+
+                
+                save_time = time.time() - save_start
+                if batch_idx % 5 == 0:
+                    if save_time > 0.01:
+                        speedup = 105.0 / save_time
+                        print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 文件保存耗时: {save_time:.2f}秒 (提速约{speedup:.1f}x)")
+                    else:
+                        print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 文件保存耗时: {save_time:.2f}秒 (极快！)")
+                
+                # 打印批次完成信息和总耗时
+                batch_total_time = time.time() - batch_start_time
+                if batch_idx % 5 == 0:
+                    print(f"[Rank {accelerator.process_index}] 批次 {batch_idx} 处理完成，总耗时: {batch_total_time:.2f}秒")
+                
+                # 如果某个批次耗时过长，打印警告
+                if batch_total_time > 300:  # 5分钟
+                    print(f"[Rank {accelerator.process_index}] 警告：批次 {batch_idx} 耗时过长 ({batch_total_time:.2f}秒)")
+                
+                # 更新进度条
+                if accelerator.is_main_process:
+                    progress_bar.update(1)
+                
+                # 每隔一定批次添加同步点，防止进程间差距过大
+                # 使用中等同步频率平衡性能和安全性（每10批次同步一次）
+                # 过于频繁会影响性能，过于稀疏可能导致hang检测延迟
+                if (batch_idx + 1) % 10 == 0:
+                    # 先确保本进程的CUDA操作完成
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # 每个进程都打印到达同步点的信息
+                    sync_time = time.time()
+                    print(f"[Rank {accelerator.process_index}] ⏱ [{time.strftime('%H:%M:%S')}] 到达同步点，批次 {batch_idx + 1}/{len(dataloader)}，已保存 {idx} 个文件")
                     
                     if accelerator.is_main_process:
-                        print(f"[同步完成] 所有进程已同步到批次 {batch_idx + 1}，同步耗时: {sync_duration:.2f}秒\n")
+                        print(f"\n[同步检查点] 已完成 {batch_idx + 1}/{len(dataloader)} 批次，所有进程准备同步...")
                     
-                    # 同步后清理CUDA缓存，防止内存碎片
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                
-                except Exception as sync_error:
-                    print(f"[Rank {accelerator.process_index}] 同步失败: {sync_error}")
-                    raise
+                    # 添加同步超时保护
+                    try:
+                        # 所有进程同步
+                        accelerator.wait_for_everyone()
+                        sync_duration = time.time() - sync_time
+                        
+                        if accelerator.is_main_process:
+                            print(f"[同步完成] 所有进程已同步到批次 {batch_idx + 1}，同步耗时: {sync_duration:.2f}秒\n")
+                        
+                        # 同步后清理CUDA缓存，防止内存碎片
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    except Exception as sync_error:
+                        print(f"[Rank {accelerator.process_index}] 同步失败: {sync_error}")
+                        raise
     
-      except Exception as e:
-          # 捕获异常，确保所有进程都能正确退出
-          processing_error = True
-          print(f"\n[Rank {accelerator.process_index}] 发生异常: {e}")
-          import traceback
-          traceback.print_exc()
-          
-          # 重要：即使发生异常，也要尝试通知其他进程
-          # 避免其他进程永远等待在同步点
-          try:
-              # 等待其他进程（让它们也有机会检测到问题）
-              print(f"[Rank {accelerator.process_index}] 尝试通知其他进程...")
-              accelerator.wait_for_everyone()
-          except Exception as sync_err:
-              print(f"[Rank {accelerator.process_index}] 同步失败（预期行为）: {sync_err}")
-      
-      finally:
-          # 关闭进度条
-          if accelerator.is_main_process:
-              progress_bar.close()
-              print(f"\n[主进程] 所有批次处理完成，等待其他进程...")
+        except Exception as e:
+            # 捕获异常，确保所有进程都能正确退出
+            processing_error = True
+            print(f"\n[Rank {accelerator.process_index}] 发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 重要：即使发生异常，也要尝试通知其他进程
+            # 避免其他进程永远等待在同步点
+            try:
+                # 等待其他进程（让它们也有机会检测到问题）
+                print(f"[Rank {accelerator.process_index}] 尝试通知其他进程...")
+                accelerator.wait_for_everyone()
+            except Exception as sync_err:
+                print(f"[Rank {accelerator.process_index}] 同步失败（预期行为）: {sync_err}")
+        
+        finally:
+            # 关闭进度条
+            if accelerator.is_main_process:
+                progress_bar.close()
+                print(f"\n[主进程] 所有批次处理完成，等待其他进程...")
     
     # 等待所有进程完成处理
     accelerator.wait_for_everyone()
@@ -784,8 +900,8 @@ def main():
         print(f'各进程处理数量: {all_idx.cpu().tolist()}')
         
         # 合并所有进程的失败样本（去重）
+        all_failed = []
         if all_failed_lists:
-            all_failed = []
             for proc_failed_list in all_failed_lists:
                 if proc_failed_list:
                     all_failed.extend(proc_failed_list)
@@ -819,9 +935,8 @@ def main():
                     pass
 
         total_processed = len(processed_keys)
-        total_remaining = len(dataset) 
-        total_source_pairs = total_processed + total_remaining
-        progress_pct = (total_processed / total_source_pairs * 100) if total_source_pairs > 0 else 0.0
+        # 使用源目录的实际图片总数（与1D版本保持一致）
+        progress_pct = (total_processed / total_source_images * 100) if total_source_images > 0 else 0.0
 
         with open(log_file, 'a', encoding='utf-8') as fh:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -833,16 +948,15 @@ def main():
             fh.write(f"  - 各GPU处理数量: {all_idx.cpu().tolist()}\n")
             if all_failed:
                 fh.write(f"  - 失败样本数: {len(all_failed)}\n")
-
             fh.write(f"\n总体进度:\n")
-            fh.write(f"  - 总样本对数: {total_source_pairs}\n")
-            fh.write(f"  - 已处理总数: {total_processed}\n")
-            fh.write(f"  - 待处理数量: {total_remaining}\n")
+            fh.write(f"  - 源目录图片总数: {total_source_images} 张\n")
+            fh.write(f"  - 已处理总数: {total_processed} 张\n")
+            fh.write(f"  - 待处理数量: {total_source_images - total_processed} 张\n")
             fh.write(f"  - 完成进度: {progress_pct:.2f}%\n")
-
             fh.write(f"\n配置信息:\n")
             fh.write(f"  - GPU数量: {accelerator.num_processes}\n")
             fh.write(f"  - 批次大小: {bz}\n")
+            fh.write(f"  - VAE类型: 2D (Autoencoder)\n")
             fh.write(f"  - 输入图像目录（embeddings/masks）: {input_image_path}\n")
             fh.write(f"  - 输出图像目录（moments）: {output_image_path}\n")
             fh.write(f"  - 保存目录: {save_dir}\n")
@@ -851,12 +965,18 @@ def main():
         
         print(f'\n处理记录已保存到: {log_file}')
         print(f'所有特征已保存到: {save_dir}')
-        print(f'\n 总体进度统计:')
-        print(f'  总样本对数: {total_source_pairs}')
+        print(f'\n总体进度统计:')
+        print(f'  源目录总图片数: {total_source_images}')
         print(f'  已处理总数: {total_processed}')
-        print(f'  待处理数量: {total_remaining}')
+        print(f'  待处理数量: {total_source_images - total_processed}')
         print(f'  完成进度: {progress_pct:.2f}%')
         print(f'==================\n')
+        
+        # 标记本次运行成功完成
+        success_file = os.path.join(save_dir, f".run_{run_id}_completed")
+        with open(success_file, 'w') as f:
+            f.write(f"Completed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print(f"本次运行已标记为成功完成: {os.path.basename(success_file)}")
 
 if __name__ == '__main__':
     # ====================================================================================

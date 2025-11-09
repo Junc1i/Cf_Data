@@ -761,24 +761,86 @@ def main():
                     all_embeddings.append(te_t)
                     all_masks.append(np.array(tm_t))
 
-                # 堆叠为数组（更高效）
+                # 堆叠为数组
                 batch_data['moments'] = np.stack(all_moments)      # [batch_size, 8, 32, 32]
                 batch_data['embeddings'] = np.stack(all_embeddings)  # [batch_size, 576, 2048]
                 batch_data['masks'] = np.stack(all_masks)
 
                 try:
-                    # 原子写：先写 .tmp 再替换
-                    tmp_path = batch_file + ".tmp"
-                    np.savez_compressed(tmp_path, **batch_data)
-                    os.replace(tmp_path, batch_file)
+                    # 确保保存目录存在且可写
+                    if not os.path.exists(save_dir):
+                        os.makedirs(save_dir, exist_ok=True)
+                        print(f"[Rank {process_id}] 创建保存目录: {save_dir}")
+                    
+                    # 计算数据大小
+                    estimated_size_mb = (
+                        batch_data['moments'].nbytes + 
+                        batch_data['embeddings'].nbytes + 
+                        batch_data['masks'].nbytes
+                    ) / (1024 * 1024)
+                    
+                    if batch_idx % 5 == 0:
+                        print(f"[Rank {process_id}] 批次 {batch_idx} 数据大小: {estimated_size_mb:.1f}MB")
+                    
+                    # 直接保存最终文件（不使用临时文件，不压缩）
+                    try:
+                        np.savez(batch_file, **batch_data)  # 不压缩
+                    except Exception as save_err:
+                        print(f"[Rank {process_id}] np.savez 失败: {save_err}")
+                        raise
+                    
+                    # 等待文件系统同步
+                    max_retries = 10
+                    retry_delay = 0.5  # 秒
+                    for retry in range(max_retries):
+                        if os.path.exists(batch_file):
+                            # 验证文件大小是否合理（至少应该有几MB）
+                            file_size = os.path.getsize(batch_file)
+                            if file_size > 1024 * 1024:  # 至少1MB
+                                break
+                            else:
+                                print(f"[Rank {process_id}] 文件大小异常: {file_size} bytes，等待同步...")
+                        
+                        if retry < max_retries - 1:
+                            time.sleep(retry_delay)
+                        else:
+                            raise FileNotFoundError(
+                                f"文件创建失败或文件大小异常: {batch_file}, "
+                                f"等待{max_retries * retry_delay}秒后仍未成功"
+                            )
 
                     saved_count = len(batch_names)
                     idx += saved_count
 
                     if batch_idx % 5 == 0:
-                        print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功（2D VAE），文件: {os.path.basename(batch_file)}")
+                        file_size_mb = os.path.getsize(batch_file) / (1024 * 1024)
+                        print(f"[Rank {process_id}] 批次 {batch_idx} 批量保存成功，文件: {os.path.basename(batch_file)}, 大小: {file_size_mb:.1f}MB")
                 except Exception as e:
                     print(f'[Rank {process_id}] 批量保存失败: {e}')
+                    print(f'[Rank {process_id}] 保存目录: {save_dir}')
+                    print(f'[Rank {process_id}] 目标文件: {batch_file}')
+                    print(f'[Rank {process_id}] 保存目录是否存在: {os.path.exists(save_dir)}')
+                    print(f'[Rank {process_id}] 保存目录是否可写: {os.access(save_dir, os.W_OK) if os.path.exists(save_dir) else "N/A"}')
+                    
+                    # 检查目标文件状态
+                    if os.path.exists(batch_file):
+                        try:
+                            file_size = os.path.getsize(batch_file)
+                            print(f'[Rank {process_id}] 文件已存在，大小: {file_size} bytes')
+                        except:
+                            print(f'[Rank {process_id}] 文件已存在但无法获取大小')
+                    else:
+                        print(f'[Rank {process_id}] 文件不存在')
+                    
+                    # 检查磁盘空间（网络存储可能返回0）
+                    try:
+                        stat = shutil.disk_usage(save_dir if os.path.exists(save_dir) else os.path.dirname(save_dir))
+                        print(f'[Rank {process_id}] 磁盘空间 - 总计: {stat.total/(1024**3):.2f}GB, 已用: {stat.used/(1024**3):.2f}GB, 剩余: {stat.free/(1024**3):.2f}GB')
+                        if stat.total == 0:
+                            print(f'[Rank {process_id}] 注意：这可能是网络存储/云盘，显示空间为0是正常的')
+                    except Exception as disk_err:
+                        print(f'[Rank {process_id}] 无法获取磁盘空间信息: {disk_err}')
+                    
                     import traceback
                     traceback.print_exc()
 

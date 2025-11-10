@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#################### resume 版本修改运行脚本为extract_train_feature_2D_resume.py ####################
+
 # 多GPU并行处理脚本 - 2D特征提取版本（Autoencoder）
 # 适用于单一数据集或单个任务
 # 使用accelerate launch启动多卡并行
@@ -59,3 +61,4 @@ accelerate launch \
     --mixed_precision=fp16 \
     --multi_gpu \
     extract_train_feature_2D.py 2>&1 | tee extract_vis_2D_log.txt
+# resume 版本修改运行脚本为extract_train_feature_2D_resume.py
